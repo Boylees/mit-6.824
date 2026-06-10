@@ -18,12 +18,15 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	//	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.5840/labgob"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
@@ -138,6 +141,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -158,6 +168,18 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []logEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -197,11 +219,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 		rf.state = "follower"
 		rf.isLeader = false
-		ms := 200 + (rand.Int63() % 200)
-		rf.electionTime = time.Duration(ms) * time.Millisecond
-		rf.lastHeard = time.Now()
 	}
 
 	if args.Term < rf.currentTerm {
@@ -211,6 +231,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if (rf.votedFor == -1 || (rf.votedFor == args.CandidateId)) && rf.upToDate(args) {
 		rf.votedFor = args.CandidateId
+		rf.persist()
+		rf.state = "follower"
+		rf.isLeader = false
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.lastHeard = time.Now()
@@ -298,6 +321,7 @@ func (rf *Raft) AppendSolution(args *AppendEntriesArgs) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 		rf.state = "follower"
 		rf.isLeader = false
 		ms := 200 + (rand.Int63() % 200)
@@ -327,6 +351,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	rf.state = "follower"
@@ -369,17 +394,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		index := args.PrevLogIndex + 1 + i // 这条 entry 的 Raft index
 
 		if index <= len(rf.log) {
-			// 本地已经有这个 index，检查 term 是否冲突
 			if rf.log[index-1].Term != args.Entries[i].Term {
-				// 从冲突位置开始截断，再追加 leader 剩余 entries
 				rf.log = rf.log[:index-1]
 				rf.log = append(rf.log, args.Entries[i:]...)
+				rf.persist()
 				break
 			}
-			// term 相同，说明这条已经有了，继续看下一条
 		} else {
 			// 本地没有这个 index，直接追加 leader 剩余 entries
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -417,6 +441,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	rf.log = append(rf.log, logEntry{command, term})
+	rf.persist()
 	index = len(rf.log)
 	term = rf.currentTerm
 	rf.mu.Unlock()
@@ -461,8 +486,7 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 200 + (rand.Int63() % 200)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -472,6 +496,7 @@ func (rf *Raft) startElection() {
 	rf.state = "candidate"
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.isLeader = false
 	rf.lastHeard = time.Now()
 	ms := 200 + (rand.Int63() % 200)
@@ -509,6 +534,7 @@ func (rf *Raft) startElection() {
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
+							rf.persist()
 							rf.state = "follower"
 							rf.isLeader = false
 							ms := 200 + (rand.Int63() % 200)
@@ -521,6 +547,7 @@ func (rf *Raft) startElection() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.votedFor = -1
+						rf.persist()
 						rf.state = "follower"
 						rf.isLeader = false
 						ms := 200 + (rand.Int63() % 200)
@@ -542,9 +569,9 @@ func (rf *Raft) startElection() {
 					rf.nextIndex[i] = len(rf.log) + 1
 					rf.matchIndex[i] = 0
 				}
+				go rf.broadcastHeartbeat(tempTerm)
 				ms := 200 + (rand.Int63() % 200)
 				rf.electionTime = time.Duration(ms) * time.Millisecond
-				rf.broadcastHeartbeat(rf.currentTerm)
 			}
 		}()
 	}
@@ -607,14 +634,31 @@ func (rf *Raft) broadcastHeartbeat(term int) {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.persist()
+				rf.state = "follower"
+				rf.isLeader = false
+				ms := 200 + (rand.Int63() % 200)
+				rf.electionTime = time.Duration(ms) * time.Millisecond
+				return
+			}
 			if rf.isLeader == false {
 				return
 			}
+			if rf.currentTerm != args.Term {
+				return
+			}
 			if reply.Success == false {
+				if args.PrevLogIndex != rf.nextIndex[server] - 1 {
+					return
+				}
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.state = "follower"
 					rf.votedFor = -1
+					rf.persist()
 					rf.isLeader = false
 					ms := 200 + (rand.Int63() % 200)
 					rf.electionTime = time.Duration(ms) * time.Millisecond
@@ -642,11 +686,18 @@ func (rf *Raft) broadcastHeartbeat(term int) {
 					rf.nextIndex[server] = 1
 				}
 			} else {
-				sendLastIndex := args.PrevLogIndex + len(args.Entries)
-				if sendLastIndex > rf.matchIndex[server] {
-					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-					rf.nextIndex[server] = rf.matchIndex[server] + 1
+				if !rf.isLeader || rf.currentTerm != args.Term {
+					return
 				}
+
+				sendLastIndex := args.PrevLogIndex + len(args.Entries)
+
+				if sendLastIndex < rf.matchIndex[server] {
+					return
+				}
+
+				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[server] = rf.matchIndex[server] + 1
 				rf.tryAdvanceCommitIndex()
 			}
 
@@ -667,8 +718,13 @@ func (rf *Raft) tryAdvanceCommitIndex() {
 			}
 		}
 
+		oldCommit := rf.commitIndex
+
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
+			DPrintf("S%d T%d advance commit %d -> %d, logTerm=%d, match=%v, logLen=%d",
+				rf.me, rf.currentTerm, oldCommit, rf.commitIndex,
+				rf.log[N-1].Term, rf.matchIndex, len(rf.log))
 			break
 		}
 	}
