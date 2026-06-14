@@ -18,10 +18,3 @@ func minval(a, b int) int {
 	}
 	return b
 }
-
-func maxval(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
