@@ -65,11 +65,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
-	votedFor    int
-	log         []logEntry
-	state       State
+	currentTerm       int
+	votedFor          int
+	log               []logEntry
+	lastIncludedIndex int
+	lastIncludedTerm  int
 
+	state       State
 	commitIndex int
 	lastApplied int
 
@@ -96,14 +98,22 @@ const (
 )
 
 func (rf *Raft) lastLogIndex() int {
-	return len(rf.log) - 1
+	return len(rf.log) + rf.lastIncludedIndex - 1
 }
 
 func (rf *Raft) lastLogTerm() int {
 	if rf.lastLogIndex() < 1 {
 		return 0
 	}
-	return rf.log[rf.lastLogIndex()].Term
+	return rf.log[rf.localLogIndex(rf.lastLogIndex())].Term
+}
+
+func (rf *Raft) globalLogIndex(localLogIndex int) int {
+	return rf.lastIncludedIndex + localLogIndex
+}
+
+func (rf *Raft) localLogIndex(globalLogIndex int) int {
+	return globalLogIndex - rf.lastIncludedIndex
 }
 
 func (rf *Raft) resetElectionTimeout() {
@@ -148,8 +158,31 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	snapshot := rf.persister.ReadSnapshot()
+	rf.persister.Save(raftstate, snapshot)
+}
+
+func (rf *Raft) persistSnapshot(snapshot []byte) {
+	// Your code here (2C).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := labgob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// raftstate := w.Bytes()
+	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, snapshot)
 }
 
 // readPersist
@@ -176,12 +209,16 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []logEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		return
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
 }
 
 // Snapshot
@@ -190,8 +227,24 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	localLogIndex := rf.localLogIndex(index)
+	if index <= rf.lastIncludedIndex || localLogIndex <= 0 || index > rf.lastApplied || localLogIndex >= len(rf.log) {
+		return
+	}
+	localLogTerm := rf.log[localLogIndex].Term
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = localLogTerm
+	newLog := make([]logEntry, 1)
+	newLog[0] = logEntry{
+		Term: localLogTerm,
+	}
+	newLog = append(newLog, rf.log[localLogIndex+1:]...)
+	rf.log = newLog
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = localLogTerm
+	rf.persistSnapshot(snapshot)
 }
 
 // RequestVoteArgs
@@ -315,28 +368,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lastHeard = time.Now()
 	rf.resetElectionTimeout()
-
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.XTerm = -1
+		reply.XLen = rf.lastIncludedIndex + 1
+		return
+	}
 	if args.PrevLogIndex > rf.lastLogIndex() {
 		reply.Term, reply.Success = rf.currentTerm, false
 		reply.XTerm, reply.XLen = -1, rf.lastLogIndex()+1
 		return
 	}
 
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	index := rf.localLogIndex(args.PrevLogIndex)
+	if rf.log[index].Term != args.PrevLogTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
-		reply.XTerm = rf.log[args.PrevLogIndex].Term
-		index := args.PrevLogIndex
-		for index > 1 && rf.log[index-1].Term == reply.XTerm {
+		reply.XTerm = rf.log[index].Term
+		for index > 0 && rf.log[index-1].Term == reply.XTerm {
 			index--
 		}
-		reply.XIndex, reply.XLen = index, rf.lastLogIndex()+1
+		reply.XIndex = rf.globalLogIndex(index)
+		reply.XLen = rf.lastLogIndex() + 1
 		return
 	}
 
 	insertIndex := args.PrevLogIndex + 1
 	for i, entry := range args.Entries {
-		if insertIndex+i <= rf.lastLogIndex() && rf.log[insertIndex+i].Term != entry.Term {
-			rf.log = rf.log[:insertIndex+i] // 发生冲突，截断
+		if insertIndex+i <= rf.lastLogIndex() && rf.log[rf.localLogIndex(insertIndex+i)].Term != entry.Term {
+			rf.log = rf.log[:rf.localLogIndex(insertIndex+i)] // 发生冲突，截断
 			rf.log = append(rf.log, args.Entries[i:]...)
 			rf.persist()
 			break
@@ -393,9 +453,9 @@ func (rf *Raft) broadCastOrReplicate(server int) {
 	nextIndex := rf.nextIndex[server]
 
 	prevLogIndex := nextIndex - 1
-	prevLogTerm := rf.log[prevLogIndex].Term
+	prevLogTerm := rf.log[rf.localLogIndex(prevLogIndex)].Term
 
-	entries := append([]logEntry(nil), rf.log[nextIndex:]...)
+	entries := append([]logEntry(nil), rf.log[rf.localLogIndex(nextIndex):]...)
 	leaderCommit := rf.commitIndex
 
 	args := &AppendEntriesArgs{
@@ -454,26 +514,31 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 		rf.nextIndex[server] = reply.XLen
 	} else {
 		last := -1
-		for i := rf.lastLogIndex(); i >= 1; i-- {
+		for i := rf.localLogIndex(rf.lastLogIndex()); i >= 1; i-- {
 			if rf.log[i].Term == reply.XTerm {
 				last = i
 				break
 			}
 		}
 		if last >= 0 {
-			rf.nextIndex[server] = last + 1
+			rf.nextIndex[server] = rf.globalLogIndex(last + 1)
 		} else {
 			rf.nextIndex[server] = reply.XIndex
 		}
 	}
-	if rf.nextIndex[server] < 1 {
-		rf.nextIndex[server] = 1
+	minNextIndex := rf.lastIncludedIndex
+	if minNextIndex < 1 {
+		minNextIndex = 1
+	}
+
+	if rf.nextIndex[server] < minNextIndex {
+		rf.nextIndex[server] = minNextIndex
 	}
 }
 
 func (rf *Raft) commit() {
 	for N := rf.lastLogIndex(); N > rf.commitIndex; N-- {
-		if rf.log[N].Term != rf.currentTerm {
+		if rf.log[rf.localLogIndex(N)].Term != rf.currentTerm {
 			continue
 		}
 
@@ -701,7 +766,7 @@ func (rf *Raft) applier() {
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Command,
+				Command:      rf.log[rf.localLogIndex(i)].Command,
 				CommandIndex: i,
 			})
 			rf.lastApplied = i
@@ -728,20 +793,22 @@ func (rf *Raft) applier() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
-		currentTerm:   0,
-		votedFor:      -1,
-		log:           make([]logEntry, 1),
-		state:         StateFollower,
-		commitIndex:   0,
-		lastApplied:   0,
-		nextIndex:     make([]int, len(peers)),
-		matchIndex:    make([]int, len(peers)),
-		lastHeard:     time.Now(),
-		leaderTimeout: 150 * time.Millisecond,
-		peers:         peers,
-		persister:     persister,
-		me:            me,
-		applyCh:       applyCh,
+		currentTerm:       0,
+		votedFor:          -1,
+		log:               make([]logEntry, 1),
+		lastIncludedIndex: 0,
+		lastIncludedTerm:  0,
+		state:             StateFollower,
+		commitIndex:       0,
+		lastApplied:       0,
+		nextIndex:         make([]int, len(peers)),
+		matchIndex:        make([]int, len(peers)),
+		lastHeard:         time.Now(),
+		leaderTimeout:     150 * time.Millisecond,
+		peers:             peers,
+		persister:         persister,
+		me:                me,
+		applyCh:           applyCh,
 	}
 	rf.commitCond = sync.NewCond(&rf.mu)
 
@@ -750,6 +817,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetElectionTimeout()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.lastIncludedIndex
+	rf.lastApplied = rf.lastIncludedIndex
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
