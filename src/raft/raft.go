@@ -247,6 +247,94 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persistSnapshot(snapshot)
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.changeToFollower(args.Term)
+	} else if rf.state != StateFollower {
+		rf.changeToFollower(args.Term)
+	}
+
+	rf.lastHeard = time.Now()
+	rf.resetElectionTimeout()
+	reply.Term = rf.currentTerm
+
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+
+	if args.LastIncludedIndex <= rf.lastApplied {
+		rf.mu.Unlock()
+		return
+	}
+
+	newLog := make([]logEntry, 1)
+	newLog[0] = logEntry{
+		Term: args.LastIncludedTerm,
+	}
+
+	if args.LastIncludedIndex <= rf.lastLogIndex() {
+		localIndex := rf.localLogIndex(args.LastIncludedIndex)
+
+		if localIndex >= 0 && localIndex < len(rf.log) && rf.log[localIndex].Term == args.LastIncludedTerm {
+			newLog = append(newLog, rf.log[localIndex+1:]...)
+		}
+	}
+
+	rf.log = newLog
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+	}
+
+	snapshot := append([]byte(nil), args.Data...)
+	rf.persistSnapshot(snapshot)
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+
+	rf.commitCond.Broadcast()
+
+	rf.mu.Unlock()
+
+	rf.applyCh <- applyMsg
+}
+
 // RequestVoteArgs
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -449,12 +537,34 @@ func (rf *Raft) broadCastOrReplicate(server int) {
 
 	term := rf.currentTerm
 	leaderId := rf.me
-
 	nextIndex := rf.nextIndex[server]
+
+	if nextIndex > rf.lastLogIndex()+1 {
+		nextIndex = rf.lastLogIndex() + 1
+		rf.nextIndex[server] = nextIndex
+	}
+
+	if rf.nextIndex[server] <= rf.lastIncludedIndex {
+		args := &InstallSnapshotArgs{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			LastIncludedIndex: rf.lastIncludedIndex,
+			LastIncludedTerm:  rf.lastIncludedTerm,
+			Data:              rf.persister.ReadSnapshot(),
+		}
+		rf.mu.Unlock()
+
+		reply := &InstallSnapshotReply{}
+		ok := rf.sendInstallSnapshot(server, args, reply)
+		if !ok {
+			return
+		}
+		rf.handleInstallSnapshotReply(server, args, reply)
+		return
+	}
 
 	prevLogIndex := nextIndex - 1
 	prevLogTerm := rf.log[rf.localLogIndex(prevLogIndex)].Term
-
 	entries := append([]logEntry(nil), rf.log[rf.localLogIndex(nextIndex):]...)
 	leaderCommit := rf.commitIndex
 
@@ -533,6 +643,27 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 
 	if rf.nextIndex[server] < minNextIndex {
 		rf.nextIndex[server] = minNextIndex
+	}
+}
+
+func (rf *Raft) handleInstallSnapshotReply(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.changeToFollower(reply.Term)
+		return
+	}
+
+	if rf.state != StateLeader || rf.currentTerm != args.Term {
+		return
+	}
+
+	if rf.matchIndex[server] < rf.lastIncludedIndex {
+		rf.matchIndex[server] = rf.lastIncludedIndex
+	}
+
+	if rf.nextIndex[server] < rf.lastIncludedIndex+1 {
+		rf.nextIndex[server] = rf.lastIncludedIndex + 1
 	}
 }
 
