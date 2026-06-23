@@ -753,6 +753,9 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
+	// startElection() is invoked by ticker without holding the lock.
+	// The server state may have changed before the election actually starts,
+	// so the election conditions must be revalidated.
 	ok := (rf.state != StateLeader) && (time.Since(rf.lastHeard) > rf.electionTimeout)
 	if rf.killed() || !ok {
 		rf.mu.Unlock()
@@ -845,6 +848,10 @@ func (rf *Raft) changeToFollower(term int) {
 	rf.resetElectionTimeout()
 }
 
+// changeToCandidate transitions this server to the Candidate state.
+// It advances to a new term and votes for itself.
+// Since the term changes, the election timer must be reset by updating
+// the last-heard timestamp and generating a new election timeout.
 func (rf *Raft) changeToCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
@@ -872,6 +879,8 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
+
+		// If this server is not the leader and the election timeout elapses, start a new election.
 		ok := (rf.state != StateLeader) && (time.Since(rf.lastHeard) > rf.electionTimeout)
 		rf.mu.Unlock()
 		if ok {
